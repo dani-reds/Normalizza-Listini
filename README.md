@@ -1,3 +1,10 @@
+<<<<<<< HEAD
+=======
+<<<<<<< HEAD
+# Normalizza-Listini
+Progetto per normalizzare i listini
+=======
+>>>>>>> 68bd0e2 (Reorganize project structure)
 # normalize-listini
 
 Motore locale per normalizzare listini marittimi in formato `xlsx` e `pdf` e produrre un file Excel finale compatibile con l'import nel TMS.
@@ -73,3 +80,7 @@ Le cartelle `output/` e `logs/` sono ignorate da Git, cosi` la repo resta pulita
 Gli output di riferimento che vuoi conservare nel repository vanno invece in:
 
 - `samples/expected-output/`
+<<<<<<< HEAD
+=======
+>>>>>>> 50c2c27 (Reorganize project structure)
+>>>>>>> 68bd0e2 (Reorganize project structure)

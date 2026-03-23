@@ -1,4 +1,0 @@
-interface:
-  display_name: "Listini Normalization"
-  short_description: "Work safely on tariff normalization"
-  default_prompt: "Use $listini-normalization to work on the freight tariff normalization engine with minimal regressions and explicit validation."
