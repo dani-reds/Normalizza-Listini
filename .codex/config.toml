@@ -1,0 +1,10 @@
+project_name = "normalize-listini"
+main_script = "Normalize-Listino.ps1"
+rules_file = "NormalizationRules.psd1"
+
+[paths]
+samples_input = "samples/input"
+samples_expected_output = "samples/expected-output"
+output = "output"
+logs = "logs"
+docs = ".codex"

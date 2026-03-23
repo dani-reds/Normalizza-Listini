@@ -1,0 +1,17 @@
+# Runtime output
+/output/*
+!/output/.gitkeep
+
+# Debug and temporary logs
+/logs/*
+!/logs/.gitkeep
+
+# Cache
+UNLOCODE.lookup.clixml
+
+# Excel temporary lock files
+~$*.xlsx
+
+# OS noise
+Thumbs.db
+Desktop.ini

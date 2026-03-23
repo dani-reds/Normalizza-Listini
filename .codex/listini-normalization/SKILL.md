@@ -39,10 +39,10 @@ Before editing:
 
 ## What To Read Next
 
-- For a compact everyday reminder: [CHEATSHEET_LISTINI.md](C:\Users\DanieleRossi\Documents\New project\codex\CHEATSHEET_LISTINI.md)
-- For business constraints, validation checklist, and task templates: [workflow.md](C:\Users\DanieleRossi\Documents\New project\codex\listini-normalization\references\workflow.md)
-- For ready-to-use prompts for new adapters, bug fixes, and review work: [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\codex\listini-normalization\references\task-prompts.md)
-- For current project state and HMM CIT assumptions: [CHATGPT_HANDOFF_LISTINI.md](C:\Users\DanieleRossi\Documents\New project\CHATGPT_HANDOFF_LISTINI.md)
+- For a compact everyday reminder: [CHEATSHEET_LISTINI.md](C:\Users\DanieleRossi\Documents\New project\.codex\CHEATSHEET_LISTINI.md)
+- For business constraints, validation checklist, and task templates: [workflow.md](C:\Users\DanieleRossi\Documents\New project\.codex\listini-normalization\references\workflow.md)
+- For ready-to-use prompts for new adapters, bug fixes, and review work: [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\.codex\listini-normalization\references\task-prompts.md)
+- For current project state and HMM CIT assumptions: [CHATGPT_HANDOFF_LISTINI.md](C:\Users\DanieleRossi\Documents\New project\.codex\CHATGPT_HANDOFF_LISTINI.md)
 
 ## Done Criteria
 

@@ -13,8 +13,8 @@ Core files:
 
 Related context:
 
-- [CHATGPT_HANDOFF_LISTINI.md](C:\Users\DanieleRossi\Documents\New project\CHATGPT_HANDOFF_LISTINI.md)
-- [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\codex\listini-normalization\references\task-prompts.md)
+- [CHATGPT_HANDOFF_LISTINI.md](C:\Users\DanieleRossi\Documents\New project\.codex\CHATGPT_HANDOFF_LISTINI.md)
+- [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\.codex\listini-normalization\references\task-prompts.md)
 
 ## Existing Supported Adapters
 
@@ -110,7 +110,7 @@ Return:
 
 If you want a ready-to-paste task prompt, use:
 
-- [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\codex\listini-normalization\references\task-prompts.md)
+- [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\.codex\listini-normalization\references\task-prompts.md)
 
 ## HMM CIT Current Assumptions
 

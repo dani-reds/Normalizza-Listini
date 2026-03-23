@@ -9,4 +9,4 @@
 
 Use the ready prompts in:
 
-- [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\codex\listini-normalization\references\task-prompts.md)
+- [task-prompts.md](C:\Users\DanieleRossi\Documents\New project\.codex\listini-normalization\references\task-prompts.md)
