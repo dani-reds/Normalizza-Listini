@@ -13,6 +13,12 @@ param(
     [string]$Direction,
 
     [Parameter(Mandatory = $false)]
+    [string]$Reference = '',
+
+    [Parameter(Mandatory = $false)]
+    [string]$ValidityStartDate = '',
+
+    [Parameter(Mandatory = $false)]
     [string]$RulesPath = '',
 
     [Parameter(Mandatory = $false)]
@@ -588,6 +594,27 @@ function Get-ValidityWindow {
         Start = (Parse-ListinoDate $match.Groups[1].Value).ToString('yyyy-MM-dd')
         End = (Parse-ListinoDate $match.Groups[2].Value).ToString('yyyy-MM-dd')
     }
+}
+
+function Format-OutputDateText {
+    param(
+        [string]$DateText,
+        [string]$OutputFormat = 'dd/MM/yyyy'
+    )
+
+    if (-not $DateText) {
+        return ''
+    }
+
+    $formats = @('yyyy-MM-dd', 'yyyy-M-d', 'dd/MM/yyyy', 'd/M/yyyy')
+    foreach ($format in $formats) {
+        try {
+            return [DateTime]::ParseExact($DateText, $format, [System.Globalization.CultureInfo]::InvariantCulture).ToString($OutputFormat)
+        } catch {
+        }
+    }
+
+    throw "Unable to format output date '$DateText'."
 }
 
 function Resolve-PdfToTextPath {
@@ -1601,6 +1628,58 @@ function Get-DestinationMap {
     return $destinations
 }
 
+function Test-GenericClassicPairRateMatrixLayout {
+    param(
+        [object[]]$Rows,
+        [object]$HeaderRow,
+        [object[]]$Destinations,
+        [object[]]$NoteRows
+    )
+
+    if (-not $HeaderRow) {
+        return $false
+    }
+
+    $headerText = Normalize-Whitespace (Get-Cell $HeaderRow.Cells 'A' $HeaderRow.RowNumber)
+    if ($headerText -notmatch 'etd\s+\d{1,2}/\d{1,2}/\d{2,4}.*up to\s+\d{1,2}/\d{1,2}/\d{2,4}') {
+        return $false
+    }
+
+    if ((@($Destinations)).Count -ne 6) {
+        return $false
+    }
+
+    $row4 = $Rows | Where-Object { $_.RowNumber -eq 4 } | Select-Object -First 1
+    if (-not $row4) {
+        return $false
+    }
+
+    $expectedLabels = @("20'", "40'", "20'", "40'", "20'", "40'", "20'", "40'", "20'", "40'", "20'", "40'")
+    $actualLabels = @()
+    foreach ($column in @('B','C','D','E','F','G','H','I','J','K','L','M')) {
+        $actualLabels += Normalize-Whitespace (Get-Cell $row4.Cells $column 4)
+    }
+
+    if ($actualLabels.Count -ne $expectedLabels.Count) {
+        return $false
+    }
+
+    for ($i = 0; $i -lt $expectedLabels.Count; $i++) {
+        if ($actualLabels[$i] -ne $expectedLabels[$i]) {
+            return $false
+        }
+    }
+
+    $markerCount = 0
+    foreach ($pattern in @('^\+ BRC', '^\+ ECA', '^\+ Emissions Trading System', '^\+ Fuel EU')) {
+        if (Find-RowByText $NoteRows $pattern) {
+            $markerCount++
+        }
+    }
+
+    return ($markerCount -ge 3)
+}
+
 function Get-LocationCodes {
     param(
         [string]$RawName,
@@ -1927,6 +2006,64 @@ function New-PriceDetail {
         TiersType = ''
         Price = [string]$Price
     }
+}
+
+function Copy-PriceDetail {
+    param(
+        [pscustomobject]$Detail,
+        [string]$Name = '',
+        [string]$Comment = '',
+        [string]$Evaluation = ''
+    )
+
+    return [pscustomobject]@{
+        Name = if ($Name) { $Name } else { $Detail.Name }
+        Currency = $Detail.Currency
+        Comment = if ($PSBoundParameters.ContainsKey('Comment')) { $Comment } else { $Detail.Comment }
+        Evaluation = if ($Evaluation) { $Evaluation } else { $Detail.Evaluation }
+        Minimum = $Detail.Minimum
+        Maximum = $Detail.Maximum
+        TiersType = $Detail.TiersType
+        Price = [string]$Detail.Price
+    }
+}
+
+function Clear-PriceDetailComments {
+    param([object[]]$Details)
+
+    $normalizedDetails = New-Object System.Collections.Generic.List[object]
+    foreach ($detail in @($Details)) {
+        $normalizedDetails.Add((Copy-PriceDetail -Detail $detail -Comment ''))
+    }
+
+    return $normalizedDetails.ToArray()
+}
+
+function Add-Missing40HcFallbackDuplicates {
+    param(
+        [object[]]$Details,
+        [object[]]$PriceColumns
+    )
+
+    $hasExplicit40Hc = @($PriceColumns | Where-Object { $_.Evaluation -eq "Cntr 40' HC" }).Count -gt 0
+    if ($hasExplicit40Hc) {
+        return @($Details)
+    }
+
+    $hasFortyBox = @($PriceColumns | Where-Object { $_.Evaluation -eq "Cntr 40' Box" }).Count -gt 0
+    if (-not $hasFortyBox) {
+        return @($Details)
+    }
+
+    $expandedDetails = New-Object System.Collections.Generic.List[object]
+    foreach ($detail in @($Details)) {
+        $expandedDetails.Add($detail)
+        if ($detail.Evaluation -eq "Cntr 40' Box") {
+            $expandedDetails.Add((Copy-PriceDetail -Detail $detail -Evaluation "Cntrs 40' HC"))
+        }
+    }
+
+    return $expandedDetails.ToArray()
 }
 
 function Parse-AdditionalText {
@@ -4496,12 +4633,978 @@ function Convert-HmmCitWorkbook {
     Write-NormalizedWorkbook -OutputPath $OutputPath -Headers $headers -DataRows $outputRows
 }
 
+function Convert-ColumnNameToIndex {
+    param([string]$ColumnName)
+
+    $name = Normalize-Key $ColumnName
+    $index = 0
+    foreach ($char in $name.ToCharArray()) {
+        if ($char -lt 'A' -or $char -gt 'Z') {
+            continue
+        }
+        $index = ($index * 26) + ([int][char]$char - [int][char]'A' + 1)
+    }
+    return $index
+}
+
+function Get-BaselineWorkbookTargetSheetInfos {
+    param([object[]]$WorksheetInfos)
+
+    $targetNames = @(
+        'ISRAEL',
+        'ISRAEL REEFER',
+        'USA',
+        'USA REEFER',
+        'CANADA',
+        'CANADA REEFER',
+        'MEXICO',
+        'CARIBB'
+    )
+
+    return @(
+        $WorksheetInfos |
+            Where-Object { $_.State -eq 'visible' -and ($targetNames -contains (Normalize-Key $_.Name)) }
+    )
+}
+
+function Find-BaselineSheetValidityRow {
+    param([object[]]$Rows)
+
+    return ($Rows | Where-Object {
+            (Normalize-Key (Get-Cell $_.Cells 'B' $_.RowNumber)) -match '^VALIDITY:?$' -and
+            (Normalize-Whitespace (Get-Cell $_.Cells 'C' $_.RowNumber))
+        } | Select-Object -First 1)
+}
+
+function Find-BaselineSheetPolRow {
+    param([object[]]$Rows)
+
+    return ($Rows | Where-Object {
+            (Normalize-Key (Get-Cell $_.Cells 'B' $_.RowNumber)) -eq 'POL' -and
+            (Normalize-Key (Get-Cell $_.Cells 'C' $_.RowNumber)) -eq 'POD' -and
+            (Normalize-Key (Get-Cell $_.Cells 'D' $_.RowNumber)) -like 'CURRENCY*'
+        } | Select-Object -First 1)
+}
+
+function Find-BaselineSheetAddizionaliRow {
+    param(
+        [object[]]$Rows,
+        [int]$AfterRowNumber = 0
+    )
+
+    return ($Rows | Where-Object {
+            $_.RowNumber -gt $AfterRowNumber -and
+            (Normalize-Key (Get-Cell $_.Cells 'B' $_.RowNumber)) -eq 'ADDIZIONALI'
+        } | Select-Object -First 1)
+}
+
+function Parse-BaselineSheetDate {
+    param([string]$Text)
+
+    $formats = @('dd.MM.yyyy', 'd.M.yyyy', 'dd/MM/yyyy', 'd/M/yyyy')
+    foreach ($format in $formats) {
+        try {
+            return [DateTime]::ParseExact((Normalize-Whitespace $Text), $format, [System.Globalization.CultureInfo]::InvariantCulture)
+        } catch {
+        }
+    }
+
+    throw "Unable to parse Baseline workbook date '$Text'."
+}
+
+function Format-BaselineWorkbookOutputDateText {
+    param([string]$DateText)
+
+    if (-not $DateText) {
+        return ''
+    }
+
+    $formats = @('yyyy-MM-dd', 'yyyy-M-d', 'dd/MM/yyyy', 'd/M/yyyy', 'dd.MM.yyyy', 'd.M.yyyy')
+    foreach ($format in $formats) {
+        try {
+            return [DateTime]::ParseExact((Normalize-Whitespace $DateText), $format, [System.Globalization.CultureInfo]::InvariantCulture).ToString('dd/MM/yyyy')
+        } catch {
+        }
+    }
+
+    throw "Unable to format Baseline workbook date '$DateText'."
+}
+
+function Get-BaselineSheetValidityWindow {
+    param(
+        [object[]]$Rows,
+        [string]$ExplicitValidityStartDate = ''
+    )
+
+    $validityRow = Find-BaselineSheetValidityRow -Rows $Rows
+    if (-not $validityRow) {
+        throw 'Baseline workbook validity row not found.'
+    }
+
+    $dateText = Normalize-Whitespace (Get-Cell $validityRow.Cells 'C' $validityRow.RowNumber)
+    $date = Parse-BaselineSheetDate $dateText
+    return [pscustomobject]@{
+        Start = if ($ExplicitValidityStartDate) { Format-BaselineWorkbookOutputDateText $ExplicitValidityStartDate } else { '' }
+        End = $date.ToString('dd/MM/yyyy')
+    }
+}
+
+function Get-BaselineSheetCurrency {
+    param([object]$HeaderRow)
+
+    $headerText = Normalize-Key (Get-Cell $HeaderRow.Cells 'D' $HeaderRow.RowNumber)
+    if ($headerText -match '\bEUR\b' -or $headerText.Contains(([string][char]0x20AC))) {
+        return 'EUR'
+    }
+    return 'USD'
+}
+
+function Get-BaselineContainerEvaluation {
+    param([string]$Token)
+
+    $normalized = Normalize-Key ($Token -replace '''', '')
+    switch -Regex ($normalized) {
+        '^20(?:DV|GP|BOX)?$' { return "Cntr 20' Box" }
+        '^40(?:DV|GP|BOX)$' { return "Cntr 40' Box" }
+        '^40(?:HC|HQ|H)$' { return "Cntr 40' HC" }
+        '^20(?:RH|RE)$' { return "Cntr 20' Reefer" }
+        '^40(?:RH|RE)$' { return "Cntr 40' Reefer" }
+        default { return (Get-EvaluationFromUnitToken $Token) }
+    }
+}
+
+function Get-BaselineSheetPriceColumns {
+    param([object[]]$Rows)
+
+    $polRow = Find-BaselineSheetPolRow -Rows $Rows
+    if (-not $polRow) {
+        throw 'Baseline workbook POL/POD header row not found.'
+    }
+
+    $equipmentRow = $Rows | Where-Object { $_.RowNumber -eq ($polRow.RowNumber + 1) } | Select-Object -First 1
+    if (-not $equipmentRow) {
+        throw 'Baseline workbook equipment row not found.'
+    }
+
+    $priceColumns = @()
+    foreach ($cellRef in ($equipmentRow.Cells.Keys | Sort-Object { Convert-ColumnNameToIndex ($_ -replace '\d+', '') })) {
+        $column = ($cellRef -replace '\d+', '')
+        if ((Convert-ColumnNameToIndex $column) -lt (Convert-ColumnNameToIndex 'D')) {
+            continue
+        }
+
+        $token = Normalize-Whitespace (Get-Cell $equipmentRow.Cells $column $equipmentRow.RowNumber)
+        if (-not $token) {
+            continue
+        }
+
+        $priceColumns += [pscustomobject]@{
+            Column = $column
+            Evaluation = Get-BaselineContainerEvaluation $token
+            Token = $token
+        }
+    }
+
+    if ((@($priceColumns)).Count -eq 0) {
+        throw 'Baseline workbook equipment columns not found.'
+    }
+
+    return [pscustomobject]@{
+        HeaderRow = $polRow
+        EquipmentRow = $equipmentRow
+        PriceColumns = @($priceColumns)
+    }
+}
+
+function Test-BaselineWorkbookSheetLayout {
+    param([object[]]$Rows)
+
+    try {
+        $validityRow = Find-BaselineSheetValidityRow -Rows $Rows
+        $sheetColumns = Get-BaselineSheetPriceColumns -Rows $Rows
+        $addizionaliRow = Find-BaselineSheetAddizionaliRow -Rows $Rows -AfterRowNumber $sheetColumns.EquipmentRow.RowNumber
+        if (-not $validityRow -or -not $addizionaliRow) {
+            return $false
+        }
+
+        [void](Parse-BaselineSheetDate (Get-Cell $validityRow.Cells 'C' $validityRow.RowNumber))
+        return ((@($sheetColumns.PriceColumns)).Count -ge 1)
+    } catch {
+        return $false
+    }
+}
+
+function Test-BaselineWorkbookFamily {
+    param(
+        [object[]]$WorksheetInfos,
+        [string[]]$SharedStrings
+    )
+
+    $targetSheets = @(Get-BaselineWorkbookTargetSheetInfos -WorksheetInfos $WorksheetInfos)
+    if ($targetSheets.Count -lt 7) {
+        return $false
+    }
+
+    $normalizedNames = @($targetSheets | ForEach-Object { Normalize-Key $_.Name })
+    foreach ($requiredName in @('ISRAEL', 'USA', 'CANADA', 'MEXICO', 'CARIBB')) {
+        if (-not ($normalizedNames -contains $requiredName)) {
+            return $false
+        }
+    }
+
+    $reeferCount = @($normalizedNames | Where-Object { $_ -like '*REEFER' }).Count
+    if ($reeferCount -lt 2) {
+        return $false
+    }
+
+    $layoutMatches = 0
+    foreach ($sheetInfo in ($targetSheets | Select-Object -First 3)) {
+        $rows = Get-WorksheetRows -WorksheetPath $sheetInfo.Path -SharedStrings $SharedStrings
+        if (Test-BaselineWorkbookSheetLayout -Rows $rows) {
+            $layoutMatches++
+        }
+    }
+
+    return ($layoutMatches -ge 2)
+}
+
+function Get-BaselineSheetCountryHint {
+    param([string]$SheetName)
+
+    $normalized = Normalize-Key ($SheetName -replace '\s+REEFER$', '')
+    switch ($normalized) {
+        'ISRAEL' { return 'IL' }
+        'USA' { return 'US' }
+        'CANADA' { return 'CA' }
+        'MEXICO' { return 'MX' }
+        default { return '' }
+    }
+}
+
+function Get-BaselineLocationAliasMap {
+    return @{
+        'GENOVA' = @('ITGOA')
+        'LIVORNO' = @('ITLIV')
+        'ASHDOD' = @('ILASH')
+        'HAIFA' = @('ILHFA')
+        'NEW YORK' = @('USNYC')
+        'NORFOLK' = @('USORF')
+        'SAVANNAH' = @('USSAV')
+        'PORT EVERGLADES' = @('USPEF')
+        'HALIFAX' = @('CAHAL')
+        'TORONTO' = @('CATOR')
+        'MONTREAL' = @('CAMTR')
+        'VANCOUVER' = @('CAVAN')
+        'VERACRUZ' = @('MXVER')
+        'ALTAMIRA' = @('MXATM')
+        'KINGSTON' = @('JMKIN')
+        'PORT OF SPAIN' = @('TTPOS')
+        'POINT LISAS' = @('TTPTS')
+        'PARAMARIBO' = @('SRPBM')
+        'SAN JUAN' = @('PRSJU')
+        'SAN JUAN, PUERTO RICO' = @('PRSJU')
+        'RIO HAINA' = @('DOHAI')
+        'CAUCEDO' = @('DOCAU')
+        'PUERTO CORTES' = @('HNPCR')
+        'GEORGETOWN, GRAND CAYMAN' = @('KYGEC')
+        'GEORGETOWN, GUYANA' = @('GYGEO')
+        'BRIDGETOWN' = @('BBBGI')
+        'MOIN' = @('CRPMN')
+        'MANZANILLO' = @('PAMIT')
+        'PANAMA MANZANILLO' = @('PAMIT')
+        'LA GUAIRA' = @('VELAG')
+        'PUERTO CABELLO' = @('VEPBL')
+        'SANTO TOMAS DE CASTILLA' = @('GTSTC')
+        'PUERTO SANTO TOMAS DE CASTILLA' = @('GTSTC')
+        'SAN ANTONIO' = @('CLSAI')
+        'CARTAGENA' = @('COSPC')
+        'GUAYAQUIL' = @('ECGYE')
+        'CALLAO' = @('PEPUE')
+        'PUERTO CALLAO' = @('PEPUE')
+        'HOUSTON' = @('USHOU')
+        'CHICAGO' = @('USCHI')
+    }
+}
+
+function Normalize-BaselineLocationText {
+    param(
+        [string]$Text,
+        [switch]$IsDestination
+    )
+
+    $value = Normalize-Whitespace $Text
+    if (-not $value) {
+        return ''
+    }
+
+    if ($IsDestination) {
+        if ((Normalize-Key $value) -eq 'GEORGETOWN GRAND CAYMAN') {
+            return 'Georgetown, Grand Cayman'
+        }
+        if ((Normalize-Key $value) -eq 'GEORGETOWN GUYANNA') {
+            return 'Georgetown, Guyana'
+        }
+        if ((Normalize-Key $value) -eq 'BRIDGETOWN - BARBADOS') {
+            return 'Bridgetown'
+        }
+        if ((Normalize-Key $value) -eq 'SAN JUAN -PUERTO RICO') {
+            return 'San Juan, Puerto Rico'
+        }
+        if ((Normalize-Key $value) -eq 'SAN JUAN - PUERTO RICO') {
+            return 'San Juan, Puerto Rico'
+        }
+        if ((Normalize-Key $value) -eq 'PANAMA MANZANILLO') {
+            return 'Panama Manzanillo'
+        }
+        if ((Normalize-Key $value) -eq 'SANTO TOMAS DE CASTILLA') {
+            return 'Puerto Santo Tomas de Castilla'
+        }
+
+        $value = [regex]::Replace($value, '\((?i:\s*via.*?)\)', '')
+        $value = [regex]::Replace($value, '(?i)\bvia\b.*$', '')
+        $value = [regex]::Replace($value, '(?i)\bRAMP\b', '')
+        $value = [regex]::Replace($value, '(?i)\bGUYANNA\b', 'Guyana')
+    }
+
+    return (Normalize-Whitespace $value)
+}
+
+function Split-BaselineLocationField {
+    param(
+        [string]$Text,
+        [switch]$IsDestination
+    )
+
+    $source = Normalize-BaselineLocationText -Text $Text -IsDestination:$IsDestination
+    if (-not $source) {
+        return @()
+    }
+
+    $segments = @($source -split '\s*/\s*' | Where-Object { $_ })
+    if ($segments.Count -eq 0) {
+        return @()
+    }
+
+    $results = New-Object System.Collections.Generic.List[string]
+    foreach ($segment in $segments) {
+        Add-UniqueString -List $results -Value (Normalize-BaselineLocationText -Text $segment -IsDestination:$IsDestination)
+    }
+
+    return $results.ToArray()
+}
+
+function Resolve-BaselineLocationCodes {
+    param(
+        [string]$RawName,
+        [hashtable]$Rules,
+        [hashtable]$UnlocodeLookup,
+        [string]$CountryHint = ''
+    )
+
+    $aliases = Get-BaselineLocationAliasMap
+    $normalized = Normalize-Key $RawName
+    if ($aliases.ContainsKey($normalized)) {
+        return @($aliases[$normalized])
+    }
+
+    return @(Get-LocationCodes -RawName $RawName -Rules $Rules -UnlocodeLookup $UnlocodeLookup -CountryHint $CountryHint)
+}
+
+function Get-BaselineSheetRateRows {
+    param(
+        [object[]]$Rows,
+        [int]$StartRowNumber,
+        [int]$EndRowNumber,
+        [object[]]$PriceColumns
+    )
+
+    $result = @()
+    foreach ($row in ($Rows | Where-Object { $_.RowNumber -ge $StartRowNumber -and $_.RowNumber -lt $EndRowNumber } | Sort-Object RowNumber)) {
+        $originText = Normalize-Whitespace (Get-Cell $row.Cells 'B' $row.RowNumber)
+        $destinationText = Normalize-Whitespace (Get-Cell $row.Cells 'C' $row.RowNumber)
+        if (-not $originText -or -not $destinationText) {
+            continue
+        }
+
+        $hasNumericRate = $false
+        foreach ($priceColumn in $PriceColumns) {
+            $rateText = Normalize-Whitespace (Get-Cell $row.Cells $priceColumn.Column $row.RowNumber)
+            if ($rateText -match '^\d+(?:[.,]\d+)?$') {
+                $hasNumericRate = $true
+                break
+            }
+        }
+
+        if ($hasNumericRate) {
+            $result += $row
+        }
+    }
+
+    return $result
+}
+
+function Get-BaselineSheetAdditionalRows {
+    param(
+        [object[]]$Rows,
+        [int]$StartRowNumber
+    )
+
+    $result = @()
+    $started = $false
+    foreach ($row in ($Rows | Where-Object { $_.RowNumber -gt $StartRowNumber } | Sort-Object RowNumber)) {
+        $bText = Normalize-Whitespace (Get-Cell $row.Cells 'B' $row.RowNumber)
+        $cText = Normalize-Whitespace (Get-Cell $row.Cells 'C' $row.RowNumber)
+        $aText = Normalize-Whitespace (Get-Cell $row.Cells 'A' $row.RowNumber)
+
+        if (-not $started) {
+            if ($bText -or $cText) {
+                $started = $true
+            } else {
+                continue
+            }
+        }
+
+        $normalizedB = Normalize-Key $bText
+        $normalizedA = Normalize-Key $aText
+        if ((-not $bText -and -not $cText) -or
+            $normalizedB -eq 'PORT' -or
+            $normalizedB -like 'CURRENT WHARFAGE CHARGES*' -or
+            $normalizedA -like '*FREE TIME*' -or
+            $normalizedA -like '*THANK ADDITIONAL PLUG IN*') {
+            break
+        }
+
+        $result += $row
+    }
+
+    return $result
+}
+
+function Convert-BaselineAdditionalRowsToGenericRows {
+    param([object[]]$Rows)
+
+    $converted = @()
+    foreach ($row in $Rows) {
+        $name = Normalize-Whitespace (Get-Cell $row.Cells 'B' $row.RowNumber)
+        $amount = Normalize-Whitespace (Get-Cell $row.Cells 'C' $row.RowNumber)
+        $scope = Normalize-Whitespace (Get-Cell $row.Cells 'D' $row.RowNumber)
+        if (-not $name -and -not $amount -and -not $scope) {
+            continue
+        }
+
+        $cells = @{}
+        $cells["A$($row.RowNumber)"] = $name
+        $cells["B$($row.RowNumber)"] = $amount
+        $cells["C$($row.RowNumber)"] = $scope
+        $converted += [pscustomobject]@{
+            RowNumber = $row.RowNumber
+            Cells = $cells
+        }
+    }
+
+    return $converted
+}
+
+function Get-BaselineAdditionalDetails {
+    param(
+        [object[]]$Rows,
+        [string]$Carrier,
+        [string]$Direction,
+        [hashtable]$Rules,
+        [string]$DestinationName
+    )
+
+    if (-not $Carrier -or -not $Direction) {
+        return @()
+    }
+
+    $convertedRows = @(Convert-BaselineAdditionalRowsToGenericRows -Rows $Rows)
+    if ($convertedRows.Count -eq 0) {
+        return @()
+    }
+
+    try {
+        $templates = @(Get-ExpectedAdditionalDetails -Rows $convertedRows -Carrier $Carrier -Direction $Direction -Rules $Rules)
+    } catch {
+        return @()
+    }
+
+    $details = @()
+    foreach ($template in $templates) {
+        if (Should-ApplyAdditionalToDestination -ApplyTargets $template.AppliesTo -DestinationName $DestinationName) {
+            $details += $template.Detail
+        }
+    }
+
+    return $details
+}
+
+function Convert-BaselineWorkbookFamily {
+    param(
+        [string[]]$SharedStrings,
+        [object[]]$WorksheetInfos,
+        [string]$OutputPath,
+        [string]$Carrier,
+        [string]$Direction,
+        [string]$Reference = '',
+        [string]$ValidityStartDate = '',
+        [hashtable]$Rules,
+        [string]$UnlocodePath = ''
+    )
+
+    $sheetInfos = @(Get-BaselineWorkbookTargetSheetInfos -WorksheetInfos $WorksheetInfos)
+    $normalizedCarrier = if ($Carrier) { Normalize-Key $Carrier } else { '' }
+    $normalizedDirection = if ($Direction) { Normalize-Key $Direction } else { '' }
+
+    $rawLocationNames = New-Object System.Collections.Generic.List[string]
+    $sheetContexts = @()
+    foreach ($sheetInfo in $sheetInfos) {
+        $rows = Get-WorksheetRows -WorksheetPath $sheetInfo.Path -SharedStrings $SharedStrings
+        $validity = Get-BaselineSheetValidityWindow -Rows $rows -ExplicitValidityStartDate $ValidityStartDate
+        $sheetColumns = Get-BaselineSheetPriceColumns -Rows $rows
+        $priceColumns = @($sheetColumns.PriceColumns)
+        $addizionaliRow = Find-BaselineSheetAddizionaliRow -Rows $rows -AfterRowNumber $sheetColumns.EquipmentRow.RowNumber
+        if (-not $addizionaliRow) {
+            throw "Baseline workbook ADDIZIONALI block not found on sheet '$($sheetInfo.Name)'."
+        }
+
+        $rateRows = @(Get-BaselineSheetRateRows -Rows $rows -StartRowNumber ($sheetColumns.EquipmentRow.RowNumber + 1) -EndRowNumber $addizionaliRow.RowNumber -PriceColumns $priceColumns)
+        $additionalRows = @(Get-BaselineSheetAdditionalRows -Rows $rows -StartRowNumber $addizionaliRow.RowNumber)
+        $countryHint = Get-BaselineSheetCountryHint -SheetName $sheetInfo.Name
+        $isReefer = ((Normalize-Key $sheetInfo.Name) -like '*REEFER') -or (@($priceColumns | Where-Object { $_.Evaluation -like "*Reefer" }).Count -gt 0)
+        $currency = Get-BaselineSheetCurrency -HeaderRow $sheetColumns.HeaderRow
+
+        foreach ($rateRow in $rateRows) {
+            foreach ($originName in @(Split-BaselineLocationField -Text (Get-Cell $rateRow.Cells 'B' $rateRow.RowNumber))) {
+                Add-UniqueString -List $rawLocationNames -Value $originName
+            }
+            foreach ($destinationName in @(Split-BaselineLocationField -Text (Get-Cell $rateRow.Cells 'C' $rateRow.RowNumber) -IsDestination)) {
+                Add-UniqueString -List $rawLocationNames -Value $destinationName
+            }
+        }
+
+        $sheetContexts += [pscustomobject]@{
+            SheetInfo = $sheetInfo
+            Rows = $rows
+            Validity = $validity
+            PriceColumns = $priceColumns
+            RateRows = $rateRows
+            AdditionalRows = $additionalRows
+            CountryHint = $countryHint
+            IsReefer = $isReefer
+            Currency = $currency
+        }
+    }
+
+    $unlocodeLookup = Import-UnlocodeLookup -Path $UnlocodePath -RawNames $rawLocationNames.ToArray()
+    $headers = Get-OutputHeaders
+    $outputRows = @()
+    $rowIndex = 1
+
+    foreach ($sheetContext in $sheetContexts) {
+        foreach ($rateRow in $sheetContext.RateRows) {
+            $originNames = @(Split-BaselineLocationField -Text (Get-Cell $rateRow.Cells 'B' $rateRow.RowNumber))
+            $destinationNames = @(Split-BaselineLocationField -Text (Get-Cell $rateRow.Cells 'C' $rateRow.RowNumber) -IsDestination)
+            foreach ($originName in $originNames) {
+                $originCodes = @(Resolve-BaselineLocationCodes -RawName $originName -Rules $Rules -UnlocodeLookup $unlocodeLookup -CountryHint 'IT')
+                foreach ($destinationName in $destinationNames) {
+                    $destinationCodes = @(Resolve-BaselineLocationCodes -RawName $destinationName -Rules $Rules -UnlocodeLookup $unlocodeLookup -CountryHint $sheetContext.CountryHint)
+                    $details = @()
+                    foreach ($priceColumn in $sheetContext.PriceColumns) {
+                        $rateValue = Convert-LocalizedNumberText (Get-Cell $rateRow.Cells $priceColumn.Column $rateRow.RowNumber)
+                        if ($rateValue -match '^-?\d+(?:[.,]\d+)?$') {
+                            $details += (New-PriceDetail 'Ocean Freight - Containers' $sheetContext.Currency '' $priceColumn.Evaluation $rateValue)
+                        }
+                    }
+
+                    $details += @(Get-BaselineAdditionalDetails -Rows $sheetContext.AdditionalRows -Carrier $normalizedCarrier -Direction $normalizedDirection -Rules $Rules -DestinationName $destinationName)
+
+                    foreach ($originCode in $originCodes) {
+                        foreach ($destinationCode in $destinationCodes) {
+                            $outputRows += Convert-RouteToRow -Index $rowIndex -FromAddress $originCode -ToAddress $destinationCode -ValidityStart $sheetContext.Validity.Start -ValidityEnd $sheetContext.Validity.End -Carrier $normalizedCarrier -PriceDetails $details -Reference $Reference
+                            $rowIndex++
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Write-NormalizedWorkbook -OutputPath $OutputPath -Headers $headers -DataRows $outputRows
+}
+
+function Get-Baseline2WorkbookTariffSheetInfos {
+    param([object[]]$WorksheetInfos)
+
+    return @(
+        $WorksheetInfos |
+            Where-Object {
+                $_.State -eq 'visible' -and
+                $_.Name -ne 'ADDITIONAL & LOCAL CHARGES'
+            } |
+            Sort-Object Name
+    )
+}
+
+function Get-Baseline2ExpectedPolGroups {
+    return @(
+        [pscustomobject]@{ Name = 'GENOVA'; Column = 'E'; PriceColumns = @('E', 'F', 'G') },
+        [pscustomobject]@{ Name = 'LA SPEZIA'; Column = 'H'; PriceColumns = @('H', 'I', 'J') },
+        [pscustomobject]@{ Name = 'VENEZIA'; Column = 'K'; PriceColumns = @('K', 'L', 'M') },
+        [pscustomobject]@{ Name = 'ANCONA'; Column = 'N'; PriceColumns = @('N', 'O', 'P') },
+        [pscustomobject]@{ Name = 'LIVORNO'; Column = 'Q'; PriceColumns = @('Q', 'R', 'S') },
+        [pscustomobject]@{ Name = 'NAPOLI'; Column = 'T'; PriceColumns = @('T', 'U', 'V') },
+        [pscustomobject]@{ Name = 'TRIESTE'; Column = 'W'; PriceColumns = @('W', 'X', 'Y') }
+    )
+}
+
+function Get-Baseline2SheetValidityWindow {
+    param([object[]]$Rows)
+
+    $validityRow = $Rows | Where-Object {
+        $_.RowNumber -eq 4 -and
+        (Normalize-Key (Get-Cell $_.Cells 'M' $_.RowNumber)) -like "RATE'S VALIDITY*"
+    } | Select-Object -First 1
+    if (-not $validityRow) {
+        throw 'Baseline2 workbook validity row not found.'
+    }
+
+    $startDate = Parse-BaselineSheetDate (Get-Cell $validityRow.Cells 'T' $validityRow.RowNumber)
+    $endDate = Parse-BaselineSheetDate (Get-Cell $validityRow.Cells 'W' $validityRow.RowNumber)
+    return [pscustomobject]@{
+        Start = $startDate.ToString('dd/MM/yyyy')
+        End = $endDate.ToString('dd/MM/yyyy')
+    }
+}
+
+function Get-Baseline2SheetPolGroups {
+    param([object[]]$Rows)
+
+    $headerRow = $Rows | Where-Object { $_.RowNumber -eq 12 } | Select-Object -First 1
+    $equipmentRow = $Rows | Where-Object { $_.RowNumber -eq 13 } | Select-Object -First 1
+    if (-not $headerRow -or -not $equipmentRow) {
+        throw 'Baseline2 workbook tariff header rows not found.'
+    }
+
+    if ((Normalize-Key (Get-Cell $headerRow.Cells 'A' 12)) -ne 'COUNTRY' -or
+        (Normalize-Key (Get-Cell $headerRow.Cells 'B' 12)) -ne 'POD' -or
+        (Normalize-Key (Get-Cell $headerRow.Cells 'C' 12)) -ne 'TERM' -or
+        (Normalize-Key (Get-Cell $headerRow.Cells 'D' 12)) -ne 'SERVICE VIA' -or
+        (Normalize-Key (Get-Cell $headerRow.Cells 'Z' 12)) -ne 'REMARKS') {
+        throw 'Baseline2 workbook tariff header labels not recognized.'
+    }
+
+    $groups = @()
+    foreach ($group in (Get-Baseline2ExpectedPolGroups)) {
+        $headerName = Normalize-Whitespace (Get-Cell $headerRow.Cells $group.Column 12)
+        if ((Normalize-Key $headerName) -ne $group.Name) {
+            throw "Baseline2 workbook POL header '$($group.Name)' not found in column $($group.Column)."
+        }
+
+        $priceColumns = @()
+        foreach ($column in $group.PriceColumns) {
+            $token = Normalize-Whitespace (Get-Cell $equipmentRow.Cells $column 13)
+            if (-not $token) {
+                throw "Baseline2 workbook equipment header missing in column $column."
+            }
+
+            $tokenKey = Normalize-Key ($token -replace '''', '' -replace '\s+', '')
+            $evaluation = switch ($tokenKey) {
+                '20BOX' { "Cntr 20' Box"; break }
+                '40BOX' { "Cntr 40' Box"; break }
+                '40HC'  { "Cntrs 40' HC"; break }
+                default { Get-BaselineContainerEvaluation $token }
+            }
+
+            $priceColumns += [pscustomobject]@{
+                Column = $column
+                Evaluation = $evaluation
+                Token = $token
+            }
+        }
+
+        $groups += [pscustomobject]@{
+            OriginName = $group.Name
+            PriceColumns = $priceColumns
+        }
+    }
+
+    return @($groups)
+}
+
+function Test-Baseline2WorkbookSheetLayout {
+    param([object[]]$Rows)
+
+    try {
+        [void](Get-Baseline2SheetValidityWindow -Rows $Rows)
+        [void](Get-Baseline2SheetPolGroups -Rows $Rows)
+        $titleRow = $Rows | Where-Object { $_.RowNumber -eq 7 } | Select-Object -First 1
+        if (-not $titleRow) {
+            return $false
+        }
+
+        $title = Normalize-Key (Get-Cell $titleRow.Cells 'A' 7)
+        if ($title -notlike 'EXPORT F.A.K. RATES FROM ORIGIN ITALY TO *') {
+            return $false
+        }
+
+        return ((Normalize-Key (Get-Cell ($Rows | Where-Object { $_.RowNumber -eq 13 } | Select-Object -First 1).Cells 'AD' 13)) -like '*ADDITIONAL*LOCAL*CHARGE*')
+    } catch {
+        return $false
+    }
+}
+
+function Test-Baseline2WorkbookFamily {
+    param(
+        [object[]]$WorksheetInfos,
+        [string[]]$SharedStrings
+    )
+
+    $visibleSheets = @($WorksheetInfos | Where-Object { $_.State -eq 'visible' })
+    if ($visibleSheets.Count -ne 3) {
+        return $false
+    }
+
+    $additionalSheet = $visibleSheets | Where-Object { $_.Name -eq 'ADDITIONAL & LOCAL CHARGES' } | Select-Object -First 1
+    if (-not $additionalSheet) {
+        return $false
+    }
+
+    $tariffSheets = @(Get-Baseline2WorkbookTariffSheetInfos -WorksheetInfos $WorksheetInfos)
+    if ($tariffSheets.Count -ne 2) {
+        return $false
+    }
+
+    foreach ($sheetInfo in $tariffSheets) {
+        if ($sheetInfo.Name -notlike 'F.A.K.*') {
+            return $false
+        }
+
+        $rows = Get-WorksheetRows -WorksheetPath $sheetInfo.Path -SharedStrings $SharedStrings
+        if (-not (Test-Baseline2WorkbookSheetLayout -Rows $rows)) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Get-Baseline2CountryHint {
+    param([string]$CountryText)
+
+    switch -Regex (Normalize-Key $CountryText) {
+        '^AUSTRALIA$' { return 'AU' }
+        '^BANGLADESH$' { return 'BD' }
+        '^CAMBODIA$' { return 'KH' }
+        '^CHINA' { return 'CN' }
+        '^HONG KONG$' { return 'HK' }
+        '^INDIA$' { return 'IN' }
+        '^INDONESIA$' { return 'ID' }
+        '^JAPAN$' { return 'JP' }
+        '^KOREA' { return 'KR' }
+        '^MALAYSIA$' { return 'MY' }
+        '^MYANMAR$' { return 'MM' }
+        '^NEW ZEALAND$' { return 'NZ' }
+        '^PAKISTAN$' { return 'PK' }
+        '^PHILIPPINES$' { return 'PH' }
+        '^SINGAPORE$' { return 'SG' }
+        '^SRI LANKA$' { return 'LK' }
+        '^TAIWAN$' { return 'TW' }
+        '^THAILAND$' { return 'TH' }
+        '^VIETNAM$' { return 'VN' }
+        default { return '' }
+    }
+}
+
+function Resolve-Baseline2OriginCodes {
+    param([string]$OriginName)
+
+    switch (Normalize-Key $OriginName) {
+        'GENOVA' { return @('ITGOA') }
+        'LA SPEZIA' { return @('ITSPE') }
+        'VENEZIA' { return @('ITVCE') }
+        'ANCONA' { return @('ITAOI') }
+        'LIVORNO' { return @('ITLIV') }
+        'NAPOLI' { return @('ITNAP') }
+        'TRIESTE' { return @('ITTRS') }
+        default { throw "Baseline2 origin mapping not configured for '$OriginName'." }
+    }
+}
+
+function Resolve-Baseline2DestinationCodes {
+    param(
+        [string]$DestinationName,
+        [string]$CountryHint,
+        [hashtable]$Rules,
+        [hashtable]$UnlocodeLookup
+    )
+
+    $aliases = @{
+        'ADELAIDE' = @('AUADL')
+        'BANGKOK PAT, BMT, BBT' = @('THBKK')
+        'BELAWAN' = @('IDBLW')
+        'BRISBANE' = @('AUBNE')
+        'CHITTAGONG' = @('BDCGP')
+        'HO-CHI-MINH (CAI MEP)' = @('VNCMT')
+        'HO-CHI-MINH (CAT LAI)' = @('VNSGN')
+        'INCHON' = @('KRINC')
+        'JAKARTA' = @('IDJKT')
+        'KEELUNG' = @('TWKEL')
+        'KUANTAN' = @('MYKUA')
+        'LYTTELTON' = @('NZLYT')
+        'NAGOYA' = @('JPNGO')
+        'NAHA' = @('JPNAH')
+        'NANHAI (SANSHAN)' = @('CNNAH')
+        'NAPIER' = @('NZNPE')
+        'NHAVA SHEVA' = @('INNSA')
+        'PALEMBANG' = @('IDPLM')
+        'PASIR GUDANG' = @('MYPGU')
+        'PORT KELANG' = @('MYPKG')
+        'RONGQI' = @('CNROQ')
+        'SIHANOUKVILLE' = @('KHKOS')
+        'SYDNEY' = @('AUSYD')
+        'TAIZHOU' = @('CNTAZ')
+        'XINHUI' = @('CNXIN')
+        'ZHONGSHAN' = @('CNZSN')
+    }
+
+    $normalized = Normalize-Key $DestinationName
+    if ($aliases.ContainsKey($normalized)) {
+        return @($aliases[$normalized])
+    }
+
+    return @(Get-LocationCodes -RawName $DestinationName -Rules $Rules -UnlocodeLookup $UnlocodeLookup -CountryHint $CountryHint)
+}
+
+function Get-Baseline2SheetRateRows {
+    param(
+        [object[]]$Rows,
+        [object[]]$PolGroups
+    )
+
+    $result = @()
+    foreach ($row in ($Rows | Where-Object { $_.RowNumber -ge 14 } | Sort-Object RowNumber)) {
+        $countryText = Normalize-Whitespace (Get-Cell $row.Cells 'A' $row.RowNumber)
+        $destinationText = Normalize-Whitespace (Get-Cell $row.Cells 'B' $row.RowNumber)
+        $termText = Normalize-Whitespace (Get-Cell $row.Cells 'C' $row.RowNumber)
+
+        $hasTariffToken = $false
+        foreach ($group in $PolGroups) {
+            foreach ($priceColumn in $group.PriceColumns) {
+                $rateText = Normalize-Whitespace (Get-Cell $row.Cells $priceColumn.Column $row.RowNumber)
+                if ($rateText -match '^\d+(?:[.,]\d+)?$' -or (Normalize-Key $rateText) -eq 'NO SERVICE OPTION') {
+                    $hasTariffToken = $true
+                    break
+                }
+            }
+            if ($hasTariffToken) {
+                break
+            }
+        }
+
+        if ($countryText -and $destinationText -and $termText -and $hasTariffToken) {
+            $result += $row
+            continue
+        }
+
+        if ($result.Count -gt 0) {
+            break
+        }
+    }
+
+    return @($result)
+}
+
+function Convert-Baseline2WorkbookFamily {
+    param(
+        [string[]]$SharedStrings,
+        [object[]]$WorksheetInfos,
+        [string]$OutputPath,
+        [string]$Carrier,
+        [string]$Direction,
+        [string]$Reference = '',
+        [hashtable]$Rules,
+        [string]$UnlocodePath = ''
+    )
+
+    $sheetInfos = @(Get-Baseline2WorkbookTariffSheetInfos -WorksheetInfos $WorksheetInfos)
+    $resolvedCarrier = if ($Carrier) { Normalize-Key $Carrier } else { '' }
+    $rawLocationNames = New-Object System.Collections.Generic.List[string]
+    foreach ($group in (Get-Baseline2ExpectedPolGroups)) {
+        Add-UniqueString -List $rawLocationNames -Value $group.Name
+    }
+
+    $sheetContexts = @()
+    foreach ($sheetInfo in $sheetInfos) {
+        $rows = Get-WorksheetRows -WorksheetPath $sheetInfo.Path -SharedStrings $SharedStrings
+        $validity = Get-Baseline2SheetValidityWindow -Rows $rows
+        $polGroups = @(Get-Baseline2SheetPolGroups -Rows $rows)
+        $rateRows = @(Get-Baseline2SheetRateRows -Rows $rows -PolGroups $polGroups)
+        foreach ($rateRow in $rateRows) {
+            Add-UniqueString -List $rawLocationNames -Value (Normalize-Whitespace (Get-Cell $rateRow.Cells 'B' $rateRow.RowNumber))
+        }
+
+        $sheetContexts += [pscustomobject]@{
+            SheetInfo = $sheetInfo
+            Validity = $validity
+            PolGroups = $polGroups
+            RateRows = $rateRows
+        }
+    }
+
+    $unlocodeLookup = Import-UnlocodeLookup -Path $UnlocodePath -RawNames $rawLocationNames.ToArray()
+    $headers = Get-OutputHeaders
+    $outputRows = @()
+    $rowIndex = 1
+
+    foreach ($sheetContext in $sheetContexts) {
+        foreach ($rateRow in $sheetContext.RateRows) {
+            $countryText = Normalize-Whitespace (Get-Cell $rateRow.Cells 'A' $rateRow.RowNumber)
+            $destinationName = Normalize-Whitespace (Get-Cell $rateRow.Cells 'B' $rateRow.RowNumber)
+            $remarks = Normalize-Whitespace (Get-Cell $rateRow.Cells 'Z' $rateRow.RowNumber)
+            $countryHint = Get-Baseline2CountryHint -CountryText $countryText
+            $destinationCodes = @(Resolve-Baseline2DestinationCodes -DestinationName $destinationName -CountryHint $countryHint -Rules $Rules -UnlocodeLookup $unlocodeLookup)
+
+            foreach ($group in $sheetContext.PolGroups) {
+                $details = @()
+                foreach ($priceColumn in $group.PriceColumns) {
+                    $rateText = Normalize-Whitespace (Get-Cell $rateRow.Cells $priceColumn.Column $rateRow.RowNumber)
+                    if (-not $rateText -or (Normalize-Key $rateText) -eq 'NO SERVICE OPTION') {
+                        continue
+                    }
+
+                    $rateValue = Convert-LocalizedNumberText $rateText
+                    if ($rateValue -match '^-?\d+(?:[.,]\d+)?$') {
+                        $details += (New-PriceDetail 'Ocean Freight - Containers' 'USD' '' $priceColumn.Evaluation $rateValue)
+                    }
+                }
+
+                if ($details.Count -eq 0) {
+                    continue
+                }
+
+                $originCodes = @(Resolve-Baseline2OriginCodes -OriginName $group.OriginName)
+                foreach ($originCode in $originCodes) {
+                    foreach ($destinationCode in $destinationCodes) {
+                        $outputRows += Convert-RouteToRow -Index $rowIndex -FromAddress $originCode -ToAddress $destinationCode -ValidityStart $sheetContext.Validity.Start -ValidityEnd $sheetContext.Validity.End -Carrier $resolvedCarrier -PriceDetails $details -Reference $Reference -Comment $remarks
+                        $rowIndex++
+                    }
+                }
+            }
+        }
+    }
+
+    Write-NormalizedWorkbook -OutputPath $OutputPath -Headers $headers -DataRows $outputRows
+}
+
 function Convert-ListinoToNormalizedWorkbook {
     param(
         [string]$InputPath,
         [string]$OutputPath,
         [string]$Carrier,
         [string]$Direction,
+        [string]$Reference = '',
+        [string]$ValidityStartDate = '',
         [hashtable]$Rules,
         [string]$UnlocodePath = ''
     )
@@ -4537,6 +5640,16 @@ function Convert-ListinoToNormalizedWorkbook {
             return
         }
 
+        if (Test-BaselineWorkbookFamily -WorksheetInfos $worksheetInfos -SharedStrings $sharedStrings) {
+            Convert-BaselineWorkbookFamily -SharedStrings $sharedStrings -WorksheetInfos $worksheetInfos -OutputPath $OutputPath -Carrier $Carrier -Direction $Direction -Reference $Reference -ValidityStartDate $ValidityStartDate -Rules $Rules -UnlocodePath $UnlocodePath
+            return
+        }
+
+        if (Test-Baseline2WorkbookFamily -WorksheetInfos $worksheetInfos -SharedStrings $sharedStrings) {
+            Convert-Baseline2WorkbookFamily -SharedStrings $sharedStrings -WorksheetInfos $worksheetInfos -OutputPath $OutputPath -Carrier $Carrier -Direction $Direction -Reference $Reference -Rules $Rules -UnlocodePath $UnlocodePath
+            return
+        }
+
         $worksheetPath = Get-FirstVisibleWorksheetPath -PackageRoot $packageRoot
         $rows = Get-WorksheetRows -WorksheetPath $worksheetPath -SharedStrings $sharedStrings
 
@@ -4545,8 +5658,19 @@ function Convert-ListinoToNormalizedWorkbook {
         $destinations = Get-DestinationMap $rows
         $rateRows = Get-RateRows $rows
         $noteRows = @($rows | Where-Object { $_.RowNumber -gt $rateRows[-1].RowNumber })
-        $resolvedContext = Resolve-CarrierDirection -Rows $noteRows -Rules $Rules -Carrier $Carrier -Direction $Direction
-        $templates = Get-ExpectedAdditionalDetails -Rows $noteRows -Carrier $resolvedContext.Carrier -Direction $resolvedContext.Direction -Rules $Rules
+        $isClassicPairMatrixLayout = Test-GenericClassicPairRateMatrixLayout -Rows $rows -HeaderRow $headerRow -Destinations $destinations -NoteRows $noteRows
+        $formattedValidityStart = if ($isClassicPairMatrixLayout) { Format-OutputDateText $validity.Start } else { $validity.Start }
+        $formattedValidityEnd = if ($isClassicPairMatrixLayout) { Format-OutputDateText $validity.End } else { $validity.End }
+        $resolvedCarrier = if ($Carrier) { Normalize-Key $Carrier } else { '' }
+        $resolvedDirection = if ($Direction) { Normalize-Key $Direction } else { '' }
+        if ($resolvedCarrier -and -not $resolvedDirection) {
+            $resolvedDirection = (Resolve-CarrierDirection -Rows $noteRows -Rules $Rules -Carrier $resolvedCarrier -Direction '').Direction
+        }
+
+        $templates = @()
+        if ($resolvedCarrier -and $resolvedDirection) {
+            $templates = Get-ExpectedAdditionalDetails -Rows $noteRows -Carrier $resolvedCarrier -Direction $resolvedDirection -Rules $Rules
+        }
         $rawLocationNames = New-Object System.Collections.Generic.List[string]
         foreach ($rateRow in $rateRows) {
             Add-UniqueString -List $rawLocationNames -Value (Get-Cell $rateRow.Cells 'A' $rateRow.RowNumber)
@@ -4571,7 +5695,8 @@ function Convert-ListinoToNormalizedWorkbook {
                         foreach ($priceColumn in $destination.PriceColumns) {
                             $rate = Normalize-Whitespace (Get-Cell $rateRow.Cells $priceColumn.Column $rateRow.RowNumber)
                             if ($rate) {
-                                $details += (New-PriceDetail 'OCEAN FREIGHT - CONTAINERS' 'USD' '' $priceColumn.Evaluation $rate)
+                                $oceanFreightLabel = if ($isClassicPairMatrixLayout) { 'Ocean Freight - Containers' } else { 'OCEAN FREIGHT - CONTAINERS' }
+                                $details += (New-PriceDetail $oceanFreightLabel 'USD' '' $priceColumn.Evaluation $rate)
                             }
                         }
 
@@ -4581,7 +5706,12 @@ function Convert-ListinoToNormalizedWorkbook {
                             }
                         }
 
-                        $outputRows += Convert-RouteToRow -Index $rowIndex -FromAddress $originCode -ToAddress $destinationCode -ValidityStart $validity.Start -ValidityEnd $validity.End -Carrier $resolvedContext.Carrier -PriceDetails $details
+                        if ($isClassicPairMatrixLayout) {
+                            $details = Add-Missing40HcFallbackDuplicates -Details $details -PriceColumns $destination.PriceColumns
+                            $details = Clear-PriceDetailComments -Details $details
+                        }
+
+                        $outputRows += Convert-RouteToRow -Index $rowIndex -FromAddress $originCode -ToAddress $destinationCode -ValidityStart $formattedValidityStart -ValidityEnd $formattedValidityEnd -Carrier $resolvedCarrier -PriceDetails $details -Reference $Reference
                         $rowIndex++
                     }
                 }
@@ -4727,7 +5857,7 @@ if (-not $OutputPath) {
 $extension = [System.IO.Path]::GetExtension($InputPath).ToLowerInvariant()
 switch ($extension) {
     '.xlsx' {
-        Convert-ListinoToNormalizedWorkbook -InputPath $InputPath -OutputPath $OutputPath -Carrier $Carrier -Direction $Direction -Rules $rules -UnlocodePath $resolvedUnlocodePath
+Convert-ListinoToNormalizedWorkbook -InputPath $InputPath -OutputPath $OutputPath -Carrier $Carrier -Direction $Direction -Reference $Reference -ValidityStartDate $ValidityStartDate -Rules $rules -UnlocodePath $resolvedUnlocodePath
         break
     }
     '.pdf' {
