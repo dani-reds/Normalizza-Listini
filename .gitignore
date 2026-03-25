@@ -6,8 +6,8 @@
 /logs/*
 !/logs/.gitkeep
 
-# Cache
-UNLOCODE.lookup.clixml
+# Local scratch and ad hoc extracts
+/tmp/
 
 # Excel temporary lock files
 ~$*.xlsx

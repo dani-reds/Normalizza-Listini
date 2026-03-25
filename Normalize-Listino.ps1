@@ -1041,37 +1041,81 @@ function Test-HapagDryStdTariffPage {
     )
 }
 
-function Get-HapagDryStdUnsupportedPageReason {
-    param([string]$PageText)
+function Resolve-HapagDryStdEndpointCodes {
+    param(
+        [string]$RawName,
+        [string]$Label,
+        [hashtable]$Rules,
+        [hashtable]$UnlocodeLookup
+    )
 
-    $normalized = Normalize-Key $PageText
-    $routeLine = Get-HapagDryStdRouteLine -PageText $PageText -AllowMissing
-
-    if ($normalized -match 'DESTINATION LANDFREIGHT') {
-        return 'contains Destination Landfreight'
+    try {
+        $codes = @(
+            Get-LocationCodes -RawName $RawName -Rules $Rules -UnlocodeLookup $UnlocodeLookup |
+                Where-Object { $_ } |
+                Select-Object -Unique
+        )
+    }
+    catch {
+        return [pscustomobject]@{
+            Codes = @()
+            Reason = "$Label '$RawName' is not mappable reliably."
+        }
     }
 
-    if ($normalized -match 'HAULAGE IMPORT\s+DOOR') {
-        return 'contains Haulage Import Door'
+    if ($codes.Count -eq 0) {
+        return [pscustomobject]@{
+            Codes = @()
+            Reason = "$Label '$RawName' is not mappable reliably."
+        }
     }
 
-    if ($normalized -match 'D\.G\. SURCHARGE DEST\. LAND PCT') {
-        return 'contains D.G. Surcharge Dest. Land PCT'
+    if ($codes.Count -gt 1) {
+        return [pscustomobject]@{
+            Codes = @()
+            Reason = "$Label '$RawName' resolves ambiguously."
+        }
     }
 
-    if ($normalized -match 'DANGEROUS GOODS PREMIUM SEA' -or $normalized -match 'HAZARDOUS CARGO') {
-        return 'contains hazardous markers'
+    return [pscustomobject]@{
+        Codes = $codes
+        Reason = ''
+    }
+}
+
+function Get-HapagDryStdPageSupportDecision {
+    param(
+        [pscustomobject]$Route,
+        [hashtable]$Rules,
+        [hashtable]$UnlocodeLookup
+    )
+
+    $originResolution = Resolve-HapagDryStdEndpointCodes -RawName $Route.Origin -Label 'origin' -Rules $Rules -UnlocodeLookup $UnlocodeLookup
+    if ($originResolution.Reason) {
+        return [pscustomobject]@{
+            Supported = $false
+            Reason = $originResolution.Reason
+            OriginCodes = @()
+            DestinationCodes = @()
+        }
     }
 
-    if ($normalized -match 'ISIPINGO BEACH') {
-        return 'contains ISIPINGO BEACH inland destination'
+    $destinationResolution = Resolve-HapagDryStdEndpointCodes -RawName $Route.Destination -Label 'final destination' -Rules $Rules -UnlocodeLookup $UnlocodeLookup
+    if ($destinationResolution.Reason) {
+        return [pscustomobject]@{
+            Supported = $false
+            Reason = $destinationResolution.Reason
+            OriginCodes = @()
+            DestinationCodes = @()
+        }
     }
 
-    if ($routeLine -and ([regex]::Matches($routeLine, '\svia\s+', 'IgnoreCase')).Count -gt 1) {
-        return 'contains route with double via'
+    return [pscustomobject]@{
+        Supported = $true
+        Reason = ''
+        OriginCodes = @($originResolution.Codes)
+        DestinationCodes = @($destinationResolution.Codes)
     }
-
-    return ''
 }
 
 function Get-HapagDryStdReference {
@@ -1114,10 +1158,6 @@ function Get-HapagDryStdRoute {
     param([string]$PageText)
 
     $routeLine = Get-HapagDryStdRouteLine -PageText $PageText
-    if (([regex]::Matches($routeLine, '\svia\s+', 'IgnoreCase')).Count -ne 1) {
-        throw "Unsupported Hapag dry/std route line '$routeLine'."
-    }
-
     return (Parse-HapagRoute -RouteText $routeLine)
 }
 
@@ -1254,7 +1294,7 @@ function Convert-HapagDryStdPdfToNormalizedWorkbook {
 
     $rawPdfText = Get-PdfText -InputPath $InputPath -Mode 'raw'
     $pageInfos = @(Get-HapagDryStdPdfPageInfos -PdfText $rawPdfText)
-    $supportedPages = @()
+    $candidatePages = @()
     $unsupportedPageReasons = New-Object System.Collections.Generic.List[string]
     $rawLocationNames = New-Object System.Collections.Generic.List[string]
 
@@ -1263,24 +1303,36 @@ function Convert-HapagDryStdPdfToNormalizedWorkbook {
             continue
         }
 
-        $unsupportedReason = Get-HapagDryStdUnsupportedPageReason -PageText $pageInfo.Text
-        if ($unsupportedReason) {
-            $unsupportedPageReasons.Add(("page {0}: {1}" -f $pageInfo.Number, $unsupportedReason))
-            continue
-        }
-
         $route = Get-HapagDryStdRoute -PageText $pageInfo.Text
         Add-UniqueString -List $rawLocationNames -Value $route.Origin
         Add-UniqueString -List $rawLocationNames -Value $route.Destination
-        $supportedPages += [pscustomobject]@{
+        $candidatePages += [pscustomobject]@{
             Number = $pageInfo.Number
             Text = $pageInfo.Text
             Route = $route
         }
     }
 
+    $unlocodeLookup = Import-UnlocodeLookup -Path $UnlocodePath -RawNames $rawLocationNames.ToArray()
+    $supportedPages = @()
+    foreach ($pageInfo in $candidatePages) {
+        $supportDecision = Get-HapagDryStdPageSupportDecision -Route $pageInfo.Route -Rules $Rules -UnlocodeLookup $unlocodeLookup
+        if (-not $supportDecision.Supported) {
+            $unsupportedPageReasons.Add(("page {0}: {1}" -f $pageInfo.Number, $supportDecision.Reason))
+            continue
+        }
+
+        $supportedPages += [pscustomobject]@{
+            Number = $pageInfo.Number
+            Text = $pageInfo.Text
+            Route = $pageInfo.Route
+            OriginCodes = @($supportDecision.OriginCodes)
+            DestinationCodes = @($supportDecision.DestinationCodes)
+        }
+    }
+
     if ($unsupportedPageReasons.Count -gt 0) {
-        Write-Warning ("Skipping unsupported Hapag dry/std PDF pages: {0}. Door/inland/hazardous pages are not yet supported safely." -f ($unsupportedPageReasons -join '; '))
+        Write-Warning ("Skipping Hapag dry/std PDF pages that are not resolvable reliably as port-to-port routes: {0}" -f ($unsupportedPageReasons -join '; '))
     }
 
     if ((@($supportedPages)).Count -eq 0) {
@@ -1289,7 +1341,6 @@ function Convert-HapagDryStdPdfToNormalizedWorkbook {
 
     $reference = Get-HapagDryStdReference -Text $rawPdfText
     $headers = Get-OutputHeaders
-    $unlocodeLookup = Import-UnlocodeLookup -Path $UnlocodePath -RawNames $rawLocationNames.ToArray()
     $outputRows = @()
     $rowIndex = 1
 
@@ -1300,8 +1351,8 @@ function Convert-HapagDryStdPdfToNormalizedWorkbook {
         $priceDetails += Get-HapagDryStdOceanFreightDetails -PageText $pageInfo.Text
         $priceDetails += Get-HapagDryStdAdditionalDetails -PageText $pageInfo.Text -Carrier $normalizedCarrier -Direction $normalizedDirection -Rules $Rules
 
-        foreach ($originCode in (Get-LocationCodes -RawName $pageInfo.Route.Origin -Rules $Rules -UnlocodeLookup $unlocodeLookup)) {
-            foreach ($destinationCode in (Get-LocationCodes -RawName $pageInfo.Route.Destination -Rules $Rules -UnlocodeLookup $unlocodeLookup)) {
+        foreach ($originCode in @($pageInfo.OriginCodes)) {
+            foreach ($destinationCode in @($pageInfo.DestinationCodes)) {
                 $outputRows += Convert-RouteToRow -Index $rowIndex -FromAddress $originCode -ToAddress $destinationCode -ValidityStart $validity.Start -ValidityEnd $validity.End -Carrier $normalizedCarrier -PriceDetails $priceDetails -TransitTime $transitTime -Reference $reference
                 $rowIndex++
             }

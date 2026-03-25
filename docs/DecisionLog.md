@@ -172,10 +172,21 @@ Non promuovere se:
 - Lo scope v1 include sia le pagine a tre colonne `20'STD / 40'STD / 40'HC`, sia le pagine layout-specific con `20'STD / 40'HC` senza `40'STD`.
 - Per le pagine `20'STD / 40'HC` senza `40'STD`, la mappatura approvata e` layout-specific: `Cntr 20' Box` = `20'STD`, `Cntr 40' Box` lasciato vuoto, `Cntrs 40' HC` = `40'HC`, senza duplicazioni automatiche.
 - Le route spezzate su due righe dopo `to` sono supportate dal solo adapter dedicato Hapag dry/std PDF.
-- Le pagine door/inland/hazardous restano fuori scope e vengono ignorate intenzionalmente dal nuovo adapter dedicato, con `Write-Warning` esplicito che riporta numeri pagina e motivo dello skip.
+- Marker come `Door`, `Ramp`, `Inland Waterway` e `Destination Landfreight` non sono piu` esclusori automatici nel solo adapter dedicato Hapag dry/std PDF.
 - Il workbook risultante puo` quindi essere parziale rispetto al PDF originale completo; questo comportamento e` intenzionale e non modifica l'adapter Hapag legacy.
 - La v1 port-to-port e` stata validata positivamente tramite harness separato che isola solo le pagine supportate; la regressione minima dei baseline approvati resta verde (`PASS=3 FAIL=0`).
-- Il supporto funzionale completo del file misto resta **pending**. Un eventuale supporto futuro delle pagine door/inland dovra` restare separato, prudente e senza allargare implicitamente la semantica della v1 port-to-port.
+- Il supporto funzionale completo del file misto resta **pending**. Le pagine vengono ancora skippate se il `To` finale non e` determinabile in modo affidabile oppure resta ambiguo; eventuali estensioni future dovranno restare separate e prudenti.
+
+### Hapag dry/std PDF: marker door/ramp non esclusivi
+- Per l'adapter Hapag dry/std PDF dedicato, marker come `Door`, `Ramp`, `Inland Waterway` e `Destination Landfreight` non escludono piu` automaticamente la pagina.
+- La pagina viene processata come `Ocean Freight - Containers` se la route e` leggibile e gli endpoint `From` e `To` finale sono risolti in modo univoco e affidabile secondo i mapping/regole gia` approvati.
+- In assenza di una classificazione globale repo-wide "porto marittimo / non porto marittimo", la risoluzione univoca degli endpoint viene usata come proxy operativo prudente per questa famiglia.
+- La pagina viene skippata solo se la destinazione finale non e` determinabile in modo affidabile oppure resta ambigua.
+- Questa regola resta locale al nuovo adapter dedicato e non modifica l'adapter Hapag legacy.
+
+### Promozione baseline PDF Hapag
+- I PDF `Quotation_Q2603GOA03287_CASASC_003.pdf`, `Quotation_Q2603GOA02143_GDT_002 (1).pdf` e `Quotation_Q2603GOA02149_GDT_002 (1).pdf` sono promossi a baseline approvati tramite `samples/expected-output` e `samples/SampleManifest.psd1`.
+- La promozione formalizza lo stato reale del nuovo adapter Hapag dry/std PDF dedicato e non introduce modifiche semantiche al parser.
 
 ### Route assertions piu` ricche
 - La validazione attuale e` centrata sul confronto workbook-to-workbook.
