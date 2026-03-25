@@ -1,6 +1,7 @@
 @{
     UnlocodesByName = @{
         'GENOA' = @('ITGOA')
+        'GENOA VADO LIGURE, IT' = @('ITVDL')
         'LA SPEZIA' = @('ITSPE')
         'CIVITAVECCHIA' = @('ITCVV')
         'NAPOLI' = @('ITNAP')

@@ -166,6 +166,17 @@ Non promuovere se:
 - La validazione Phase 1 oggi rigenera e confronta i baseline approvati, ma non verifica ancora il detector-routing in modo dedicato.
 - **Stato:** pending.
 
+### Hapag PDF dry/std con blocchi door/inland
+- Il file `Quotation_Q2603GOA03287_CASASC_003.pdf` non deve essere instradato sull'adapter Hapag PDF generico attuale.
+- La famiglia Hapag dry/std PDF e` ora supportata operativamente in modo parziale tramite adapter dedicato, limitatamente alle pagine port-to-port che rientrano nello scope v1.
+- Lo scope v1 include sia le pagine a tre colonne `20'STD / 40'STD / 40'HC`, sia le pagine layout-specific con `20'STD / 40'HC` senza `40'STD`.
+- Per le pagine `20'STD / 40'HC` senza `40'STD`, la mappatura approvata e` layout-specific: `Cntr 20' Box` = `20'STD`, `Cntr 40' Box` lasciato vuoto, `Cntrs 40' HC` = `40'HC`, senza duplicazioni automatiche.
+- Le route spezzate su due righe dopo `to` sono supportate dal solo adapter dedicato Hapag dry/std PDF.
+- Le pagine door/inland/hazardous restano fuori scope e vengono ignorate intenzionalmente dal nuovo adapter dedicato, con `Write-Warning` esplicito che riporta numeri pagina e motivo dello skip.
+- Il workbook risultante puo` quindi essere parziale rispetto al PDF originale completo; questo comportamento e` intenzionale e non modifica l'adapter Hapag legacy.
+- La v1 port-to-port e` stata validata positivamente tramite harness separato che isola solo le pagine supportate; la regressione minima dei baseline approvati resta verde (`PASS=3 FAIL=0`).
+- Il supporto funzionale completo del file misto resta **pending**. Un eventuale supporto futuro delle pagine door/inland dovra` restare separato, prudente e senza allargare implicitamente la semantica della v1 port-to-port.
+
 ### Route assertions piu` ricche
 - La validazione attuale e` centrata sul confronto workbook-to-workbook.
 - Route assertions e check business piu` granulari sono ancora un’estensione futura.

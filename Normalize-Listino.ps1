@@ -933,6 +933,413 @@ function Get-HapagAdditionalDetails {
     return $details
 }
 
+function Test-HapagDryStdQuotationPdfText {
+    param([string]$Text)
+
+    $normalized = Normalize-Key $Text
+    if (-not $normalized) {
+        return $false
+    }
+
+    return (
+        $normalized -match 'HAPAG-LLOYD' -and
+        $normalized -match 'QUOTATION NO\.?' -and
+        $normalized -match "20'STD" -and
+        $normalized -match "40'STD" -and
+        $normalized -match "40'HC" -and
+        $normalized -match 'FREIGHT CHARGES' -and
+        $normalized -match 'LUMPSUM' -and
+        $normalized -match 'VALID FROM' -and
+        $normalized -match 'ESTIMATED TRANSPORTATION DAYS' -and
+        $Text -match '(?im)^\s*From\s+.+?\s+via\s+.+?\s+to\s+.+$'
+    )
+}
+
+function Get-HapagDryStdPdfPageInfos {
+    param([string]$PdfText)
+
+    $pageInfos = @()
+    $pageNumber = 0
+    foreach ($page in ($PdfText -split "`f")) {
+        $pageNumber++
+        if (-not (Normalize-Whitespace $page)) {
+            continue
+        }
+
+        $pageInfos += [pscustomobject]@{
+            Number = $pageNumber
+            Text = $page
+        }
+    }
+
+    return $pageInfos
+}
+
+function Get-HapagDryStdRouteLine {
+    param(
+        [string]$PageText,
+        [switch]$AllowMissing
+    )
+
+    $lines = @($PageText -split "`r?`n")
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $candidate = Normalize-Whitespace $lines[$i]
+        if (-not ($candidate -match '^From\s+.+?\s+via\s+.+?\s+to(?:\s+.*)?$')) {
+            continue
+        }
+
+        if ($candidate -match '^From\s+.+?\s+via\s+.+?\s+to\s+.+$' -and $candidate -notmatch '\bto\s*$' -and $candidate -notmatch ',\s*$') {
+            return $candidate
+        }
+
+        $combined = $candidate
+        $limit = [Math]::Min($i + 2, $lines.Count - 1)
+        for ($j = $i + 1; $j -le $limit; $j++) {
+            $nextLine = Normalize-Whitespace $lines[$j]
+            if (-not $nextLine) {
+                continue
+            }
+
+            if ($nextLine -match '^(Freight Charges|Lumpsum|Unless otherwise specified|Export Surcharges|Import Surcharges|Valid From|Quotation No\.|Telephone|E-Mail|Chairman of the Supervisory Board|Executive Board|Registered Office)$') {
+                break
+            }
+
+            $combined = Normalize-Whitespace ($combined + ' ' + $nextLine)
+            if ($combined -match '^From\s+.+?\s+via\s+.+?\s+to\s+.+$' -and $combined -notmatch '\bto\s*$' -and $combined -notmatch ',\s*$') {
+                return $combined
+            }
+        }
+    }
+
+    if ($AllowMissing) {
+        return ''
+    }
+
+    throw 'Unable to locate route line in Hapag dry/std PDF page.'
+}
+
+function Test-HapagDryStdTariffPage {
+    param([string]$PageText)
+
+    $normalized = Normalize-Key $PageText
+    if (-not $normalized) {
+        return $false
+    }
+
+    $routeLine = Get-HapagDryStdRouteLine -PageText $PageText -AllowMissing
+    if (-not $routeLine) {
+        return $false
+    }
+
+    return (
+        $normalized -match 'FREIGHT CHARGES' -and
+        $normalized -match 'LUMPSUM' -and
+        $normalized -match "20'STD" -and
+        $normalized -match "40'HC" -and
+        $normalized -match 'VALID FROM' -and
+        $normalized -match 'ESTIMATED TRANSPORTATION DAYS'
+    )
+}
+
+function Get-HapagDryStdUnsupportedPageReason {
+    param([string]$PageText)
+
+    $normalized = Normalize-Key $PageText
+    $routeLine = Get-HapagDryStdRouteLine -PageText $PageText -AllowMissing
+
+    if ($normalized -match 'DESTINATION LANDFREIGHT') {
+        return 'contains Destination Landfreight'
+    }
+
+    if ($normalized -match 'HAULAGE IMPORT\s+DOOR') {
+        return 'contains Haulage Import Door'
+    }
+
+    if ($normalized -match 'D\.G\. SURCHARGE DEST\. LAND PCT') {
+        return 'contains D.G. Surcharge Dest. Land PCT'
+    }
+
+    if ($normalized -match 'DANGEROUS GOODS PREMIUM SEA' -or $normalized -match 'HAZARDOUS CARGO') {
+        return 'contains hazardous markers'
+    }
+
+    if ($normalized -match 'ISIPINGO BEACH') {
+        return 'contains ISIPINGO BEACH inland destination'
+    }
+
+    if ($routeLine -and ([regex]::Matches($routeLine, '\svia\s+', 'IgnoreCase')).Count -gt 1) {
+        return 'contains route with double via'
+    }
+
+    return ''
+}
+
+function Get-HapagDryStdReference {
+    param([string]$Text)
+
+    $match = [regex]::Match($Text, 'QUOTATION\s+NO\.?\s*:?\s*(Q[0-9A-Z]+)', 'IgnoreCase')
+    if (-not $match.Success) {
+        throw 'Unable to extract quotation reference from Hapag dry/std PDF.'
+    }
+
+    return $match.Groups[1].Value.ToUpperInvariant()
+}
+
+function Get-HapagDryStdValidityWindow {
+    param([string]$PageText)
+
+    $match = [regex]::Match($PageText, 'Valid From\s*(\d{2}\s+[A-Za-z]{3}\s+\d{4})\s*To\s*(\d{2}\s+[A-Za-z]{3}\s+\d{4})', 'IgnoreCase,Singleline')
+    if (-not $match.Success) {
+        throw 'Unable to extract validity dates from Hapag dry/std PDF page.'
+    }
+
+    return [pscustomobject]@{
+        Start = (Parse-ListinoDate $match.Groups[1].Value).ToString('yyyy-MM-dd')
+        End = (Parse-ListinoDate $match.Groups[2].Value).ToString('yyyy-MM-dd')
+    }
+}
+
+function Get-HapagDryStdTransitTime {
+    param([string]$PageText)
+
+    $match = [regex]::Match($PageText, 'Estimated Transportation Days\s*(\d{1,3})', 'IgnoreCase,Singleline')
+    if (-not $match.Success) {
+        throw 'Unable to extract transit time from Hapag dry/std PDF page.'
+    }
+
+    return $match.Groups[1].Value
+}
+
+function Get-HapagDryStdRoute {
+    param([string]$PageText)
+
+    $routeLine = Get-HapagDryStdRouteLine -PageText $PageText
+    if (([regex]::Matches($routeLine, '\svia\s+', 'IgnoreCase')).Count -ne 1) {
+        throw "Unsupported Hapag dry/std route line '$routeLine'."
+    }
+
+    return (Parse-HapagRoute -RouteText $routeLine)
+}
+
+function Get-HapagDryStdOceanFreightDetails {
+    param([string]$PageText)
+
+    $match = [regex]::Match($PageText, 'Lumpsum\s+USD\s+(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)', 'IgnoreCase')
+    if ($match.Success) {
+        $price20 = $match.Groups[1].Value.Replace(',', '.')
+        $price40 = $match.Groups[2].Value.Replace(',', '.')
+        $price40Hc = $match.Groups[3].Value.Replace(',', '.')
+
+        return @(
+            (New-PriceDetail 'Ocean Freight - Containers' 'USD' '' "Cntr 20' Box" $price20),
+            (New-PriceDetail 'Ocean Freight - Containers' 'USD' '' "Cntr 40' Box" $price40),
+            (New-PriceDetail 'Ocean Freight - Containers' 'USD' '' "Cntrs 40' HC" $price40Hc)
+        )
+    }
+
+    $twoColumnMatch = [regex]::Match($PageText, 'Lumpsum\s+USD\s+(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)', 'IgnoreCase')
+    if ($twoColumnMatch.Success) {
+        $price20 = $twoColumnMatch.Groups[1].Value.Replace(',', '.')
+        $price40Hc = $twoColumnMatch.Groups[2].Value.Replace(',', '.')
+
+        return @(
+            (New-PriceDetail 'Ocean Freight - Containers' 'USD' '' "Cntr 20' Box" $price20),
+            (New-PriceDetail 'Ocean Freight - Containers' 'USD' '' "Cntrs 40' HC" $price40Hc)
+        )
+    }
+
+    throw 'Unable to extract dry/std Lumpsum values from Hapag PDF page.'
+}
+
+function Parse-HapagDryStdAdditionalLine {
+    param(
+        [string]$Line,
+        [string]$CanonicalName
+    )
+
+    $normalizedLine = Normalize-Whitespace $Line
+    $match = [regex]::Match($normalizedLine, '^.+?\s+(USD|EUR|JPY)\s+(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)$', 'IgnoreCase')
+    if ($match.Success) {
+        $currency = $match.Groups[1].Value.ToUpperInvariant()
+        $price20 = $match.Groups[2].Value.Replace(',', '.')
+        $price40 = $match.Groups[3].Value.Replace(',', '.')
+        $price40Hc = $match.Groups[4].Value.Replace(',', '.')
+
+        return @(
+            (New-PriceDetail $CanonicalName $currency '' "Cntr 20' Box" $price20),
+            (New-PriceDetail $CanonicalName $currency '' "Cntr 40' Box" $price40),
+            (New-PriceDetail $CanonicalName $currency '' "Cntrs 40' HC" $price40Hc)
+        )
+    }
+
+    $twoColumnMatch = [regex]::Match($normalizedLine, '^.+?\s+(USD|EUR|JPY)\s+(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)$', 'IgnoreCase')
+    if ($twoColumnMatch.Success) {
+        $currency = $twoColumnMatch.Groups[1].Value.ToUpperInvariant()
+        $price20 = $twoColumnMatch.Groups[2].Value.Replace(',', '.')
+        $price40Hc = $twoColumnMatch.Groups[3].Value.Replace(',', '.')
+
+        return @(
+            (New-PriceDetail $CanonicalName $currency '' "Cntr 20' Box" $price20),
+            (New-PriceDetail $CanonicalName $currency '' "Cntrs 40' HC" $price40Hc)
+        )
+    }
+
+    return @()
+}
+
+function Get-HapagDryStdAdditionalDetails {
+    param(
+        [string]$PageText,
+        [string]$Carrier,
+        [string]$Direction,
+        [hashtable]$Rules
+    )
+
+    $definitions = Get-AdditionalDefinitions -ExpectedAdditionals (Get-ExpectedAdditionals -Rules $Rules -Carrier $Carrier -Direction $Direction) -Rules $Rules
+    $details = @()
+    $lines = @($PageText -split "`r?`n")
+
+    foreach ($definition in $definitions) {
+        foreach ($line in $lines) {
+            $normalizedLine = Normalize-Key $line
+            $matched = $false
+            foreach ($pattern in $definition.Patterns) {
+                if ($normalizedLine -match $pattern) {
+                    $matched = $true
+                    break
+                }
+            }
+
+            if (-not $matched) {
+                continue
+            }
+
+            $details += Parse-HapagDryStdAdditionalLine -Line $line -CanonicalName $definition.Name
+            break
+        }
+    }
+
+    return $details
+}
+
+function Convert-HapagDryStdPdfToNormalizedWorkbook {
+    param(
+        [string]$InputPath,
+        [string]$OutputPath,
+        [string]$Carrier,
+        [string]$Direction,
+        [hashtable]$Rules,
+        [string]$UnlocodePath = '',
+        [string]$PdfText = ''
+    )
+
+    $normalizedCarrier = if ($Carrier) { Normalize-Key $Carrier } else { 'HAPAG-LLOYD' }
+    $normalizedDirection = if ($Direction) { Normalize-Key $Direction } else { 'EXPORT' }
+
+    if ($normalizedCarrier -ne 'HAPAG-LLOYD') {
+        throw "Hapag dry/std PDF adapter expects carrier HAPAG-LLOYD. Received '$Carrier'."
+    }
+
+    if ($normalizedDirection -ne 'EXPORT') {
+        throw "Hapag dry/std PDF adapter expects Export direction. Received '$Direction'."
+    }
+
+    if (-not $PdfText) {
+        $PdfText = Get-PdfText -InputPath $InputPath
+    }
+
+    if (-not (Test-HapagDryStdQuotationPdfText -Text $PdfText)) {
+        throw 'Hapag dry/std PDF markers not found in the PDF text.'
+    }
+
+    $rawPdfText = Get-PdfText -InputPath $InputPath -Mode 'raw'
+    $pageInfos = @(Get-HapagDryStdPdfPageInfos -PdfText $rawPdfText)
+    $supportedPages = @()
+    $unsupportedPageReasons = New-Object System.Collections.Generic.List[string]
+    $rawLocationNames = New-Object System.Collections.Generic.List[string]
+
+    foreach ($pageInfo in $pageInfos) {
+        if (-not (Test-HapagDryStdTariffPage -PageText $pageInfo.Text)) {
+            continue
+        }
+
+        $unsupportedReason = Get-HapagDryStdUnsupportedPageReason -PageText $pageInfo.Text
+        if ($unsupportedReason) {
+            $unsupportedPageReasons.Add(("page {0}: {1}" -f $pageInfo.Number, $unsupportedReason))
+            continue
+        }
+
+        $route = Get-HapagDryStdRoute -PageText $pageInfo.Text
+        Add-UniqueString -List $rawLocationNames -Value $route.Origin
+        Add-UniqueString -List $rawLocationNames -Value $route.Destination
+        $supportedPages += [pscustomobject]@{
+            Number = $pageInfo.Number
+            Text = $pageInfo.Text
+            Route = $route
+        }
+    }
+
+    if ($unsupportedPageReasons.Count -gt 0) {
+        Write-Warning ("Skipping unsupported Hapag dry/std PDF pages: {0}. Door/inland/hazardous pages are not yet supported safely." -f ($unsupportedPageReasons -join '; '))
+    }
+
+    if ((@($supportedPages)).Count -eq 0) {
+        throw 'No supported Hapag dry/std port-to-port tariff pages found in the PDF.'
+    }
+
+    $reference = Get-HapagDryStdReference -Text $rawPdfText
+    $headers = Get-OutputHeaders
+    $unlocodeLookup = Import-UnlocodeLookup -Path $UnlocodePath -RawNames $rawLocationNames.ToArray()
+    $outputRows = @()
+    $rowIndex = 1
+
+    foreach ($pageInfo in $supportedPages) {
+        $validity = Get-HapagDryStdValidityWindow -PageText $pageInfo.Text
+        $transitTime = Get-HapagDryStdTransitTime -PageText $pageInfo.Text
+        $priceDetails = @()
+        $priceDetails += Get-HapagDryStdOceanFreightDetails -PageText $pageInfo.Text
+        $priceDetails += Get-HapagDryStdAdditionalDetails -PageText $pageInfo.Text -Carrier $normalizedCarrier -Direction $normalizedDirection -Rules $Rules
+
+        foreach ($originCode in (Get-LocationCodes -RawName $pageInfo.Route.Origin -Rules $Rules -UnlocodeLookup $unlocodeLookup)) {
+            foreach ($destinationCode in (Get-LocationCodes -RawName $pageInfo.Route.Destination -Rules $Rules -UnlocodeLookup $unlocodeLookup)) {
+                $outputRows += Convert-RouteToRow -Index $rowIndex -FromAddress $originCode -ToAddress $destinationCode -ValidityStart $validity.Start -ValidityEnd $validity.End -Carrier $normalizedCarrier -PriceDetails $priceDetails -TransitTime $transitTime -Reference $reference
+                $rowIndex++
+            }
+        }
+    }
+
+    Write-NormalizedWorkbook -OutputPath $OutputPath -Headers $headers -DataRows $outputRows
+}
+
+function Test-UnsupportedHapagDryStdDoorPdfText {
+    param([string]$Text)
+
+    $normalized = Normalize-Key $Text
+    if (-not $normalized) {
+        return $false
+    }
+
+    $hasHapagQuotationMarkers = ($normalized -match 'HAPAG-LLOYD' -and $normalized -match 'QUOTATION NO\.?')
+    if (-not $hasHapagQuotationMarkers) {
+        return $false
+    }
+
+    $hasDryStdColumns = ($normalized -match "20'STD" -and $normalized -match "40'STD" -and $normalized -match "40'HC")
+    if (-not $hasDryStdColumns) {
+        return $false
+    }
+
+    $hasDoorOrInlandMarkers = (
+        $normalized -match 'DESTINATION LANDFREIGHT' -or
+        $normalized -match 'HAULAGE IMPORT\s+DOOR' -or
+        $normalized -match 'D\.G\. SURCHARGE DEST\. LAND PCT' -or
+        $normalized -match 'ISIPINGO BEACH' -or
+        $Text -match 'From\s+[^\r\n]+?\s+via\s+[^\r\n]+?\s+via\s+[^\r\n]+?\s+to\s+'
+    )
+
+    return $hasDoorOrInlandMarkers
+}
+
 function Test-CoscoCanadaPdfText {
     param([string]$Text)
 
@@ -5826,6 +6233,16 @@ function Convert-PdfToNormalizedWorkbook {
         $resolvedDirection = if ($normalizedDirection) { $normalizedDirection } else { 'EXPORT' }
         Convert-CoscoIpakPdfToNormalizedWorkbook -InputPath $InputPath -OutputPath $OutputPath -Carrier 'COSCO' -Direction $resolvedDirection -Rules $Rules -UnlocodePath $UnlocodePath -PdfText $pdfText
         return
+    }
+
+    if ((-not $normalizedCarrier -or $normalizedCarrier -eq 'HAPAG-LLOYD') -and (Test-HapagDryStdQuotationPdfText -Text $pdfText)) {
+        $resolvedDirection = if ($normalizedDirection) { $normalizedDirection } else { 'EXPORT' }
+        Convert-HapagDryStdPdfToNormalizedWorkbook -InputPath $InputPath -OutputPath $OutputPath -Carrier 'HAPAG-LLOYD' -Direction $resolvedDirection -Rules $Rules -UnlocodePath $UnlocodePath -PdfText $pdfText
+        return
+    }
+
+    if ((-not $normalizedCarrier -or $normalizedCarrier -eq 'HAPAG-LLOYD') -and (Test-UnsupportedHapagDryStdDoorPdfText -Text $pdfText)) {
+        throw 'Unsupported Hapag PDF variant: dry/std quotation with door/inland blocks is not yet supported safely.'
     }
 
     if ((-not $normalizedCarrier -or $normalizedCarrier -eq 'HAPAG-LLOYD') -and (@(Get-HapagQuotePages -Text $pdfText)).Count -gt 0) {
